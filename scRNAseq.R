@@ -1,96 +1,213 @@
 install.packages("Seurat")
+install.packages("Matrix")
+install.packages("dplyr")
+install.packages("patchwork")
+
+if(!requireNamespace("BiocManager")) install.packages("BiocManager")
+BiocManager::install("GEOquery")
+
 library(Seurat)
-library(ggplot2)
-#remove.packages("ggrepel")
-#install.packages("ggrepel")
-library(ggrepel)
-#install.packages("SingleR")
-BiocManager::install("SingleR")
-
-library(SingleR)
+library(Matrix)
 library(dplyr)
-BiocManager::install("celldex")
+library(patchwork)
+library(GEOquery)
 
-library(celldex)
-BiocManager::install("SingleCellExperiment")
-
-library(RColorBrewer)
-BiocManager::install("RColorBrewer")
-
-library(SingleCellExperiment)
-setwd("/Users/mortezaabyadeh/Desktop")
-AST <- readRDS("AST.rds")
-head(AST)
-dim(AST)
-colnames(AST)
-class(AST)
-
-P10 <- readRDS("13.main_analysis_seuratobject-191210.rds")
-class(P10)
-dim(P10)
-head(P10)
-
-
-### this might works ###
-
-detach("package:Seurat", unload = TRUE)
-library(SeuratObject)
-P10 <- as(P10, "Seurat")
-class(P10)
+getGEOSuppFiles("GSE289940", makeDirectory = TRUE)
+untar("GSE289940/GSE289940_RAW.tar", exdir = "GSE289940/raw")
+list.files("GSE289940/raw", recursive = TRUE)
 
 
 
-saveRDS(P10, file = "P10_temp.rds")
-library(SeuratObject)
-P11 <- readRDS("P10_temp.rds")
-class(P11)
+samples <- c(
+  "GSM8801891_SWI_L1",
+  "GSM8801892_SWI_L2",
+  "GSM8801893_Con_L1",
+  "GSM8801894_Con_L2"
+)
+data_dir <- "GSE289940/raw"
 
-head(P11)
+seurat_list <- lapply(samples, function(sample){
+  
+  matrix_file <- file.path(data_dir, paste0(sample, "_matrix.mtx.gz"))
+  feature_file <- file.path(data_dir, paste0(sample, "_features.tsv.gz"))
+  barcode_file <- file.path(data_dir, paste0(sample, "_barcodes.tsv.gz"))
+  
+  mat <- readMM(matrix_file)
+  
+  features <- read.delim(feature_file, header = FALSE)
+  barcodes <- read.delim(barcode_file, header = FALSE)
+  
+  gene_names <- make.unique(features$V2)
+  
+  rownames(mat) <- gene_names
+  colnames(mat) <- barcodes$V1
+  
+  obj <- CreateSeuratObject(
+    counts = mat,
+    project = sample,
+    min.cells = 3,
+    min.features = 200
+  )
+  
+  obj$sample <- sample
+  
+  return(obj)
+})
+seurat <- merge(
+  seurat_list[[1]],
+  y = seurat_list[2:4],
+  add.cell.ids = samples,
+  project = "GSE289940"
+)
+seurat$condition <- ifelse(
+  grepl("SWI", seurat$sample),
+  "Immobilized",
+  "Control"
+)
+dim(seurat)
 
-class(P11)
-dim(P11)
 
-packageVersion("Seurat")
+seurat[["percent.mt"]] <- PercentageFeatureSet(seurat, pattern="^mt-")
+VlnPlot(seurat,
+        features=c("nFeature_RNA","nCount_RNA","percent.mt"),
+        ncol=3)
 
-remove.packages("Seurat", lib = "/Library/Frameworks/R.framework/Versions/4.4-arm64/Resources/library")
+seurat <- subset(
+  seurat,
+  subset =
+    nFeature_RNA > 200 &
+    nFeature_RNA < 6000 &
+    percent.mt < 10
+)
+dim(seurat)
+seurat <- NormalizeData(seurat)
 
-install.packages("remotes")
-
-remotes::install_version("Seurat", version = "4.4.0")
-
-packageVersion("Seurat")
-update.packages("Seurat")
-P10 <- readRDS("13.main_analysis_seuratobject-191210.rds")
-class(P10)
-dim(P10)
-head(P10)
-
-
-
-head(AST)
-summary(AST)
-class(AST)
-ElbowPlot(AST)
-srat <- FindNeighbors(AST, dims = 1:10)
-srat <- FindClusters(AST, resolution = 0.5)
-srat <- RunUMAP(AST, dims = 1:10, verbose = F)
-head(srat)
-table(srat@meta.data$seurat_clusters)
-DimPlot(AST,label.size = 4,repel = T,label = T, group.by = "nomatch_renamed")
-DimPlot(srat,label.size = 4,repel = T, label= T, group.by = "seurat_clusters")
-DimPlot(srat,label.size = 4,repel = T,label = T, group.by = "Group")
-DimPlot(srat,label.size = 4,repel = T,label = T, group.by = "FINAL")
+seurat <- FindVariableFeatures(seurat, selection.method="vst", nfeatures=2000)
+VariableFeaturePlot(seurat)
+seurat <- ScaleData(seurat)
+seurat <- RunPCA(seurat)
+ElbowPlot(seurat)
 
 
+seurat <- FindNeighbors(seurat, dims=1:20)
 
-print(unique(AST$FINAL))
-print(unique(AST$nomatch_renamed))
-FeaturePlot(srat, features = c("Aldh1l1", "Sox9"))
-VlnPlot(srat,features = "Sox9") & theme(plot.title = element_text(size=10))
-levels(Idents(AST))
-levels(Idents(srat))
-srat1 <- srat
-head(AST)
-levels(Idents(srat1)) <- unique(AST$nomatch_renamed)
-levels(Idents(srat1))
-#DimPlot(srat,label.size = 4,repel = T,label = T)
+seurat <- FindClusters(seurat, resolution=0.5)
+
+seurat <- RunUMAP(seurat, dims=1:20)
+
+DimPlot(seurat, label=TRUE)
+
+DimPlot(seurat, group.by="condition")
+
+seurat <- JoinLayers(seurat)
+markers <- FindAllMarkers(
+  seurat,
+  only.pos=TRUE,
+  min.pct=0.25,
+  logfc.threshold=0.25
+)
+
+head(markers)
+
+library(dplyr)
+
+top10 <- markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 10, order_by = avg_log2FC)
+
+DoHeatmap(seurat, features = top10$gene)
+
+FeaturePlot(seurat, features = "Tnfsf11")
+
+VlnPlot(seurat, features="Tnfsf11", group.by="condition")
+
+
+FeaturePlot(
+  seurat,
+  features = c("Runx2","Sp7","Alpl","Bglap","Col1a1","Acp5","Ctsk"),
+  ncol = 3
+)
+
+DotPlot(
+  seurat,
+  features = c("Runx2","Sp7","Alpl","Bglap","Col1a1","Acp5","Ctsk")
+) + RotatedAxis()
+
+table(Idents(seurat))
+
+osteoblast_clusters <- c(2,4,5)
+osteoclast_clusters <- c(0,6,10)
+
+
+seurat$celltype <- "Other"
+
+seurat$celltype[Idents(seurat) %in% osteoblast_clusters] <- "Osteoblast"
+seurat$celltype[Idents(seurat) %in% osteoclast_clusters] <- "Osteoclast"
+DimPlot(seurat, group.by="celltype", label=TRUE)
+DimPlot(seurat, group.by="celltype", label=TRUE)
+
+grep("Slit3", rownames(seurat), value = TRUE) ### slit3 exist in the data set (use capital first letter in mouse dataset for genes)
+FeaturePlot(seurat, features="Slit3")
+
+VlnPlot(seurat, features="Slit3")
+DotPlot(seurat, features="Slit3") + RotatedAxis()
+
+VlnPlot(
+  seurat,
+  features="Slit3",
+  group.by="seurat_clusters"
+)
+
+
+
+
+
+VlnPlot(
+  seurat,
+  features="Slit3",
+  group.by="celltype"
+)
+
+DotPlot(
+  seurat,
+  features="Slit3",
+  group.by="celltype"
+) + RotatedAxis()
+
+
+
+osteoblast <- subset(seurat, idents = osteoblast_clusters)
+FeaturePlot(osteoblast, features="Slit3")
+VlnPlot(osteoblast, features="Slit3", group.by="condition")
+
+osteoclast <- subset(seurat, idents = osteoclast_clusters)
+FeaturePlot(osteoclast, features="Slit3")
+VlnPlot(osteoclast, features="Slit3", group.by="condition")
+
+DotPlot(
+  osteoblast,
+  features="Slit3",
+  group.by="condition"
+) + RotatedAxis()
+
+DotPlot(
+  osteoclast,
+  features="Slit3",
+  group.by="condition"
+) + RotatedAxis()
+
+
+
+
+
+AverageExpression(
+  seurat,
+  features="Slit3",
+  group.by="celltype"
+)
+
+FeaturePlot(
+  seurat,
+  features = c("Tnfsf11","Slit3","Runx2","Bglap", "Ctsk"),
+  ncol = 3
+)
