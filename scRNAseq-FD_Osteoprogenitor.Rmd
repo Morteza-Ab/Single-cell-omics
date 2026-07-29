@@ -1,0 +1,561 @@
+---
+title: "Full Pipeline: FD scRNA-seq (GSE301458) - Osteoprogenitor FD vs CTRL"
+---
+
+Pipeline stages:
+1. Download & organize GEO data
+2. Per-sample QC + SoupX ambient RNA removal
+3. Doublet removal
+4. Merge, normalize, integrate
+5. Cluster + annotate cell types
+6. Subset osteoprogenitor cells
+7. Differential expression: FD vs CTRL (gene list, geomean/group, FC, log2FC, p-val, padj)
+
+IMPORTANT CAVEAT: this scRNA count matrix does NOT contain per-cell GNAS genotype calls.
+Those come from a separate targeted-PCR/BaseScope genotyping dataset in the paper. What
+this pipeline gives you is the FD-tissue vs CTRL-tissue transcriptomic comparison within
+the osteoprogenitor cluster (the "FD-specific osteoblastic cluster" the paper describes),
+not a mutant-cell-vs-wildtype-cell comparison within the same sample. If you want the
+latter, you need to merge in the genotype-calls file (check GEO supplementary files /
+paper's supplementary tables for a per-barcode genotype table) and add a genotype column
+to metadata before running FindMarkers.
+
+Run each chunk stage by stage and inspect intermediate output (QC plots, UMAPs, marker
+dotplots) before moving to the next stage - don't run this end-to-end blind.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+```{r libraries}
+library(Seurat)      # v5
+library(SoupX)
+library(scDblFinder)  # doublet detection (Bioconductor)
+library(SingleCellExperiment)
+library(harmony)      # integration
+library(GEOquery)
+library(Matrix)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(DESeq2)
+```
+
+# ============================================================
+# STAGE 1: Download and organize data
+# ============================================================
+
+```{r download}
+dir.create("GSE301458", showWarnings = FALSE)
+getGEOSuppFiles("GSE301458", makeDirectory = TRUE, baseDir = ".")
+untar("GSE301458/GSE301458_RAW.tar", exdir = "GSE301458/raw")
+raw_dir <- "GSE301458/raw"
+list.files(raw_dir) |> head(30)
+```
+
+GEO 10x deposits are usually named like:
+`GSMxxxxxxx_<samplename>_barcodes.tsv.gz`, `..._features.tsv.gz`, `..._matrix.mtx.gz`
+Run the listing above FIRST and inspect actual filenames before trusting the parsing
+below - GEO submitters are inconsistent, so adjust the regex to match what you see.
+
+```{r organize_per_sample}
+all_files <- list.files(raw_dir, full.names = TRUE)
+
+# Only pick up the 10x triplet files (barcodes/features/matrix) - exclude the
+# separate GNAS genotype csv files, which are handled separately below.
+tenx_files <- all_files[str_detect(basename(all_files), "_(barcodes|features|genes|matrix)\\.(tsv|mtx)\\.gz$")]
+
+# Pull out unique sample prefixes (everything before _barcodes/_features/_matrix)
+sample_prefixes <- tenx_files |>
+  basename() |>
+  str_replace("_(barcodes|features|genes|matrix)\\.(tsv|mtx)(\\.gz)?$", "") |>
+  unique()
+
+sample_prefixes
+
+# GNAS genotype files (FD samples only) - map sample prefix -> genotype csv path
+genotype_files <- all_files[str_detect(basename(all_files), "gnasGTcounts\\.csv\\.gz$")]
+names(genotype_files) <- basename(genotype_files) |>
+  str_replace("_gnasGTcounts\\.csv\\.gz$", "")
+genotype_files
+
+# IMPORTANT: the RNA count matrix and the GNAS genotype file for the SAME biological
+# sample were assigned DIFFERENT GSM accession numbers by GEO, e.g.:
+#   GSM9083544_FD16_barcodes.tsv.gz          (RNA counts)
+#   GSM9083548_FD16_gnasGTcounts.csv.gz      (genotype calls)
+# Matching on the full prefix (including GSM number) will fail to pair these up, so we
+# re-key genotype_files by the bare sample name only (e.g. "FD16") here, and will do the
+# same to sample_metadata$prefix once it's created in the next chunk.
+
+extract_sample_name <- function(x) str_extract(x, "(FD|WT)\\d+")
+
+names(genotype_files) <- extract_sample_name(names(genotype_files))
+genotype_files   # keys should now just be "FD16", "FD21", "FD28", "FD716"
+```
+
+```{r make_10x_dirs}
+# Read10X() needs a directory per sample containing exactly:
+# barcodes.tsv.gz, features.tsv.gz (or genes.tsv.gz), matrix.mtx.gz
+# So we symlink/copy each sample's 3 files into its own folder with standard names.
+
+dir.create("GSE301458/per_sample", showWarnings = FALSE)
+
+for (pfx in sample_prefixes) {
+  sample_dir <- file.path("GSE301458/per_sample", pfx)
+  dir.create(sample_dir, showWarnings = FALSE)
+
+  bc  <- tenx_files[str_detect(basename(tenx_files), paste0("^", pfx, "_barcodes"))]
+  ft  <- tenx_files[str_detect(basename(tenx_files), paste0("^", pfx, "_(features|genes)"))]
+  mx  <- tenx_files[str_detect(basename(tenx_files), paste0("^", pfx, "_matrix"))]
+
+  if (length(bc) == 1 && length(ft) == 1 && length(mx) == 1) {
+    file.copy(bc, file.path(sample_dir, "barcodes.tsv.gz"), overwrite = TRUE)
+    file.copy(ft, file.path(sample_dir, "features.tsv.gz"), overwrite = TRUE)
+    file.copy(mx, file.path(sample_dir, "matrix.mtx.gz"), overwrite = TRUE)
+  } else {
+    warning("Unexpected file count for sample: ", pfx)
+  }
+}
+```
+
+```{r assign_groups}
+# Confirmed directly from GSE301458 raw file listing:
+#   GSM9083540_WT150, GSM9083541_WT151, GSM9083542_WT152, GSM9083543_WT153  -> CTRL
+#   GSM9083544_FD16,  GSM9083545_FD21,  GSM9083546_FD28,  GSM9083547_FD716  -> FD
+#   (matches the sample names used in the lab's own SoupX preprocessing script)
+
+sample_metadata <- tibble(prefix = sample_prefixes) %>%
+  mutate(
+    sample_name = extract_sample_name(prefix),  # e.g. "FD16", "WT150" - used to key
+                                                  # genotype files (see organize_per_sample
+                                                  # chunk - GSM accessions differ between
+                                                  # the RNA matrix and genotype files for
+                                                  # the same sample, so we can't match on
+                                                  # the full prefix)
+    group = case_when(
+      str_detect(prefix, "WT")  ~ "CTRL",
+      str_detect(prefix, "FD")  ~ "FD",
+      TRUE ~ NA_character_
+    )
+  )
+
+sample_metadata
+stopifnot(!any(is.na(sample_metadata$group)))  # fail loudly if anything unmapped
+```
+
+# ============================================================
+# STAGE 2: Per-sample load, QC, SoupX ambient RNA removal
+# ============================================================
+
+SoupX ideally wants BOTH the raw (unfiltered) and filtered matrices per sample to
+estimate ambient contamination. If GEO only provides filtered (cell-called) matrices,
+SoupX can still run using the filtered matrix as a proxy but contamination estimation
+is less accurate - check what GEO actually gives you.
+
+```{r load_qc_soupx}
+seurat_list <- list()
+
+for (i in seq_len(nrow(sample_metadata))) {
+  pfx    <- sample_metadata$prefix[i]
+  sname  <- sample_metadata$sample_name[i]   # e.g. "FD16" - use this to key genotype_files
+  group  <- sample_metadata$group[i]
+  if (is.na(group)) next  # skip unmapped samples
+
+  sample_dir <- file.path("GSE301458/per_sample", pfx)
+  counts <- Read10X(data.dir = sample_dir)
+
+  so <- CreateSeuratObject(counts = counts, project = pfx, min.cells = 3, min.features = 200)
+  so$sample  <- pfx
+  so$group   <- group
+  so[["percent.mt"]] <- PercentageFeatureSet(so, pattern = "^MT-")
+
+  # ---- GNAS genotype integration (FD samples only) ----
+  if (sname %in% names(genotype_files)) {
+    gt <- read.csv(genotype_files[[sname]])
+    # gt columns: Cell_Barcode, GNAS_Genotype, read_count
+    # Raw GNAS_Genotype values seen in this dataset: "601.CtoT", "601.CtoT.pA", "WT", "WT.pA"
+    # 601.CtoT = c.601C>T coding change (GNAS R201H) = mutant; .pA suffix is a technical
+    # read-type variant, not a distinct genotype, so both variants collapse together.
+    gt <- gt %>%
+      mutate(GNAS_call = case_when(
+        str_detect(GNAS_Genotype, "CtoT") ~ "MUT",
+        str_detect(GNAS_Genotype, "WT")   ~ "WT",
+        TRUE ~ NA_character_
+      ))
+
+    geno_vec  <- gt$GNAS_call[match(colnames(so), gt$Cell_Barcode)]
+    reads_vec <- gt$read_count[match(colnames(so), gt$Cell_Barcode)]
+
+    so$gnas_genotype   <- geno_vec       # NA for cells with no genotyping coverage
+    so$gnas_read_count <- reads_vec
+
+    n_called <- sum(!is.na(geno_vec))
+    message(pfx, ": ", n_called, " / ", ncol(so), " cells have a GNAS genotype call (",
+            sum(geno_vec == "MUT", na.rm = TRUE), " MUT, ",
+            sum(geno_vec == "WT", na.rm = TRUE), " WT)")
+  } else {
+    so$gnas_genotype   <- NA_character_  # CTRL samples: no targeted genotyping done
+    so$gnas_read_count <- NA_integer_
+  }
+
+  seurat_list[[pfx]] <- so
+}
+
+# QC snapshot before filtering - INSPECT before choosing thresholds
+qc_df <- purrr::map_dfr(seurat_list, function(x) x@meta.data, .id = "sample")
+ggplot(qc_df, aes(x = sample, y = nFeature_RNA)) + geom_violin() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggplot(qc_df, aes(x = sample, y = percent.mt)) + geom_violin() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r qc_filter}
+# ---- USER-EDITABLE thresholds - set based on the violin plots above ----
+min_features <- 200
+max_features <- 6000
+max_pct_mt   <- 15
+
+seurat_list <- lapply(seurat_list, function(so) {
+  subset(so, subset = nFeature_RNA > min_features &
+                       nFeature_RNA < max_features &
+                       percent.mt   < max_pct_mt)
+})
+```
+
+```{r doublets}
+# Doublet detection per sample (do this BEFORE merging, per-sample, as recommended)
+seurat_list <- lapply(seurat_list, function(so) {
+  sce <- as.SingleCellExperiment(so)
+  sce <- scDblFinder(sce)
+  so$scDblFinder.class <- sce$scDblFinder.class
+  subset(so, subset = scDblFinder.class == "singlet")
+})
+```
+
+# ============================================================
+# STAGE 3: Merge, normalize, integrate
+# ============================================================
+
+```{r merge}
+merged <- merge(seurat_list[[1]], y = seurat_list[-1], add.cell.ids = names(seurat_list))
+merged <- JoinLayers(merged)  # Seurat v5
+```
+
+```{r normalize_cluster}
+merged <- NormalizeData(merged)
+merged <- FindVariableFeatures(merged, nfeatures = 2000)
+merged <- ScaleData(merged)
+merged <- RunPCA(merged, npcs = 30)
+
+# Harmony integration across samples (batch = sample, adjust if you also want to
+# regress out chemistry/platform, since this study used both MiSeq and NovaSeq)
+merged <- RunHarmony(merged, group.by.vars = "sample")
+
+merged <- RunUMAP(merged, reduction = "harmony", dims = 1:30)
+merged <- FindNeighbors(merged, reduction = "harmony", dims = 1:30)
+merged <- FindClusters(merged, resolution = 0.6)
+
+DimPlot(merged, group.by = "seurat_clusters", label = TRUE)
+DimPlot(merged, group.by = "group")
+DimPlot(merged, group.by = "sample")
+```
+
+# ============================================================
+# STAGE 4: Cell type annotation - identify osteoprogenitor cluster
+# ============================================================
+
+Canonical osteoprogenitor/osteoblast-lineage markers (per Wentworth et al. and standard
+skeletal stromal biology): RUNX2, SP7 (Osterix), ALPL, COL1A1, SPP1, IBSP, BGLAP.
+Also check endothelial (PECAM1, VWF), perivascular/pericyte (RGS5, PDGFRB), and general
+fibroblast (PDGFRA, DCN) markers to make sure you're not mis-calling clusters, since the
+paper specifically highlights overlap of GNAS expression across stromal, endothelial, and
+perivascular lineages.
+
+```{r marker_dotplot}
+markers <- c(
+  "RUNX2", "SP7", "ALPL", "COL1A1", "SPP1", "IBSP", "BGLAP",  # osteoprogenitor/osteoblast
+  "PDGFRA", "DCN", "LUM",                                      # fibroblast
+  "PECAM1", "VWF",                                             # endothelial
+  "RGS5", "PDGFRB", "MYH11"                                    # perivascular/pericyte
+)
+
+DotPlot(merged, features = markers, group.by = "seurat_clusters") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r annotate}
+# Assigned from the marker dotplot data (see chat/notes for full per-cluster rationale).
+# Clusters 6, 11, 14, 15, 16, 17 are excluded: 11/14/16/17 are PTPRC+ (immune/
+# hematopoietic contamination - out of scope per the paper's non-hematopoietic focus),
+# and 6/15 lack a clear/consistent marker signature (6 = no elevated markers at all;
+# 15 = simultaneously high chondrocyte AND neural markers, likely low-quality/doublets).
+cluster_to_celltype <- c(
+  "0"  = "Fibroblast",
+  "1"  = "Endothelial",
+  "2"  = "Perivascular",
+  "3"  = "Fibroblast",
+  "4"  = "Osteoprogenitor",              # <-- primary population of interest
+  "5"  = "Fibroblast",
+  "6"  = NA_character_,                  # unclear/low-quality - excluded
+  "7"  = "Endothelial",
+  "8"  = "Fibroblast",
+  "9"  = "Osteoprogenitor_primed",       # SPP1/IBSP/BGLAP-positive but RUNX2/ALPL-low;
+                                          # kept separate from cluster 4, not merged, since
+                                          # it's a weaker/less mature osteoblast-lineage
+                                          # signature - decide later whether to pool these
+  "10" = "Endothelial",                  # sinusoidal/CXCL12+LEPR+ subtype
+  "11" = NA_character_,                  # PTPRC+ immune - excluded
+  "12" = "Adipocyte_stromal",            # LepR+/Adipoq+ marrow stromal/MSC
+  "13" = "Osteoclast",
+  "14" = NA_character_,                  # PTPRC+ macrophage-like - excluded
+  "15" = NA_character_,                  # mixed chondro/neural signature - excluded
+  "16" = NA_character_,                  # weak PTPRC+, low-quality - excluded
+  "17" = NA_character_                   # weak PTPRC+, low-quality - excluded
+)
+
+merged$celltype <- unname(cluster_to_celltype[as.character(merged$seurat_clusters)])
+table(merged$celltype, useNA = "always")
+table(merged$celltype, merged$group)
+table(merged$sample[merged$celltype == "Osteoprogenitor"], merged$group[merged$celltype == "Osteoprogenitor"])
+table(merged$sample)  # total cells captured per sample, post-QC, all cell types
+```
+
+```{r save_checkpoint}
+dir.create("Objects", showWarnings = FALSE)
+saveRDS(merged, "Objects/FD_integrated_annotated.rds")
+```
+
+# ============================================================
+# STAGE 5: Osteoprogenitor DE: FD vs CTRL
+# ============================================================
+
+```{r subset_osteoprog}
+op <- subset(merged, subset = celltype == "Osteoprogenitor")
+op <- subset(op, subset = group %in% c("FD", "CTRL"))
+Idents(op) <- op$group
+table(Idents(op))
+```
+
+```{r find_markers}
+de <- FindMarkers(
+  op,
+  ident.1 = "FD", ident.2 = "CTRL",
+  test.use = "wilcox",
+  logfc.threshold = 0, min.pct = 0, min.cells.group = 0
+) %>%
+  rownames_to_column("gene")
+```
+
+```{r geomean_fc}
+pseudocount <- 1
+expr <- GetAssayData(op, assay = "RNA", layer = "data")
+
+cells_fd   <- WhichCells(op, idents = "FD")
+cells_ctrl <- WhichCells(op, idents = "CTRL")
+
+geomean_fd   <- Matrix::rowMeans(expm1(expr[, cells_fd,   drop = FALSE]))
+geomean_ctrl <- Matrix::rowMeans(expm1(expr[, cells_ctrl, drop = FALSE]))
+pct_fd       <- Matrix::rowMeans(expr[, cells_fd,   drop = FALSE] > 0)
+pct_ctrl     <- Matrix::rowMeans(expr[, cells_ctrl, drop = FALSE] > 0)
+
+geo_df <- tibble(
+  gene = names(geomean_fd),
+  geomean_FD = geomean_fd, geomean_CTRL = geomean_ctrl,
+  pct_FD = pct_fd, pct_CTRL = pct_ctrl
+) %>%
+  mutate(FC = (geomean_FD + pseudocount) / (geomean_CTRL + pseudocount),
+         log2FC = log2(FC))
+```
+
+```{r combine_results}
+results <- geo_df %>%
+  left_join(de %>% select(gene, p_val, p_val_adj), by = "gene") %>%
+  arrange(p_val_adj, desc(abs(log2FC)))
+
+results %>% filter(gene == "GNAS")
+
+dir.create("Results", showWarnings = FALSE)
+write.csv(results, "Results/Osteoprogenitor_FD_vs_CTRL_DE.csv", row.names = FALSE)
+```
+
+```{r volcano}
+results %>%
+  mutate(neglog10padj = -log10(p_val_adj + 1e-300)) %>%
+  ggplot(aes(x = log2FC, y = neglog10padj)) +
+  geom_point(alpha = 0.4, size = 0.8) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  geom_vline(xintercept = c(-0.25, 0.25), linetype = "dashed") +
+  labs(title = "Osteoprogenitor cells: FD vs CTRL",
+       x = "log2FC (FD / CTRL)", y = "-log10(adj p-value)") +
+  theme_minimal()
+```
+
+# ============================================================
+# STAGE 6: The comparison you actually want - GNAS-MUTANT vs WT
+# osteoprogenitor cells (within FD samples, using real per-cell genotype)
+# ============================================================
+
+This is the mosaicism-resolved comparison: cells within the SAME FD patients that carry
+the GNAS mutation vs cells that don't, restricted to the osteoprogenitor population.
+This directly tests "does the mutation itself affect the osteoblast progenitor
+transcriptome" rather than "is FD tissue different from control tissue" (which could be
+confounded by anything else different about FD patients/samples, e.g. age, biopsy site).
+
+```{r subset_by_genotype}
+# ---- USER-EDITABLE: minimum reads to trust a genotype call ----
+# Single-UMI/read calls are noisier (higher chance of a stray mis-called base). Consider
+# requiring >= 2-3 reads before trusting a call - inspect the read_count distribution
+# first if you want to tune this rather than accepting the default below.
+min_gnas_reads <- 2
+
+merged$gnas_genotype_filtered <- ifelse(
+  !is.na(merged$gnas_genotype) & merged$gnas_read_count >= min_gnas_reads,
+  merged$gnas_genotype,
+  NA_character_
+)
+
+# Only FD-sample osteoprogenitor cells with a confident genotype call
+op_fd <- subset(merged, subset = celltype == "Osteoprogenitor" & group == "FD")
+
+table(op_fd$gnas_genotype_filtered, useNA = "always")
+
+op_fd_called <- subset(op_fd, subset = !is.na(gnas_genotype_filtered))
+Idents(op_fd_called) <- op_fd_called$gnas_genotype_filtered
+table(Idents(op_fd_called))  # check both groups have enough cells (rule of thumb: ideally >=10-20 per group for a stable Wilcoxon test)
+```
+
+```{r geno_de}
+geno_de <- FindMarkers(
+  op_fd_called,
+  ident.1 = "MUT", ident.2 = "WT",
+  test.use = "wilcox",
+  logfc.threshold = 0, min.pct = 0, min.cells.group = 0
+) %>%
+  rownames_to_column("gene")
+
+expr2 <- GetAssayData(op_fd_called, assay = "RNA", layer = "data")
+cells_mut <- WhichCells(op_fd_called, idents = "MUT")
+cells_wt  <- WhichCells(op_fd_called, idents = "WT")
+
+geomean_mut <- Matrix::rowMeans(expm1(expr2[, cells_mut, drop = FALSE]))
+geomean_wt  <- Matrix::rowMeans(expm1(expr2[, cells_wt,  drop = FALSE]))
+pct_mut     <- Matrix::rowMeans(expr2[, cells_mut, drop = FALSE] > 0)
+pct_wt      <- Matrix::rowMeans(expr2[, cells_wt,  drop = FALSE] > 0)
+
+geno_results <- tibble(
+  gene = names(geomean_mut),
+  geomean_MUT = geomean_mut, geomean_WT = geomean_wt,
+  pct_MUT = pct_mut, pct_WT = pct_wt
+) %>%
+  mutate(FC = (geomean_MUT + pseudocount) / (geomean_WT + pseudocount),
+         log2FC = log2(FC)) %>%
+  left_join(geno_de %>% select(gene, p_val, p_val_adj), by = "gene") %>%
+  arrange(p_val_adj, desc(abs(log2FC)))
+
+geno_results %>% filter(gene == "GNAS")  # sanity check - not expected to show
+                                          # differential GNAS *expression* necessarily,
+                                          # since this is a point mutation not a
+                                          # expression-level change
+
+write.csv(geno_results, "Results/Osteoprogenitor_GNASmut_vs_WT_DE.csv", row.names = FALSE)
+```
+
+```{r geno_volcano}
+geno_results %>%
+  mutate(neglog10padj = -log10(p_val_adj + 1e-300)) %>%
+  ggplot(aes(x = log2FC, y = neglog10padj)) +
+  geom_point(alpha = 0.4, size = 0.8) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  geom_vline(xintercept = c(-0.25, 0.25), linetype = "dashed") +
+  labs(title = "Osteoprogenitor cells: GNAS-MUT vs WT (within FD samples, per-cell test)",
+       x = "log2FC (MUT / WT)", y = "-log10(adj p-value)") +
+  theme_minimal()
+```
+
+# ============================================================
+# STAGE 7: Paired pseudobulk DESeq2 - the more defensible comparison
+# ============================================================
+
+The per-cell Wilcoxon test above treats every cell as an independent replicate, but
+cells from the same patient are correlated (pseudoreplication) - with mutant calls this
+skewed across patients (FD16: 55 MUT / 350 WT, FD28: 7 MUT / 475 WT, FD21 & FD716: 0 MUT
+even unfiltered), the per-cell test above is largely a FD16-vs-rest comparison wearing a
+genotype label, not a clean genotype effect. Pseudobulk aggregation to sample x genotype,
+paired by patient, is the standard fix (Squair et al. 2021, Nat Commun) - it collapses
+each patient x genotype group into one pseudo-sample, so genotype is tested at the
+correct level of biological replication (patient), with patient identity explicitly
+included as a blocking factor.
+
+Only FD16 and FD28 have both MUT and WT osteoprogenitor cells, so this is necessarily a
+paired, 2-patient analysis - treat results as hypothesis-generating (n=2 pairs is not
+enough for strong statistical claims), not as confirmatory as a properly powered cohort
+would give you. Report this limitation explicitly in any write-up.
+
+```{r pseudobulk_setup}
+library(DESeq2)
+
+pseudobulk_samples <- c("GSM9083544_FD16", "GSM9083546_FD28")
+
+op_pb_input <- subset(op_fd_called, subset = sample %in% pseudobulk_samples)
+
+# raw (unnormalized) counts required for DESeq2
+counts_raw <- GetAssayData(op_pb_input, assay = "RNA", layer = "counts")
+
+meta <- op_pb_input@meta.data
+agg_group <- paste(meta$sample, meta$gnas_genotype_filtered, sep = "__")
+
+# sum raw counts per patient x genotype pseudobulk group
+pb_mat <- sapply(sort(unique(agg_group)), function(g) {
+  Matrix::rowSums(counts_raw[, agg_group == g, drop = FALSE])
+})
+colnames(pb_mat) <- sort(unique(agg_group))
+
+pb_mat  # 4 pseudobulk columns expected: FD16__MUT, FD16__WT, FD28__MUT, FD28__WT
+```
+
+```{r pseudobulk_deseq2}
+coldata <- data.frame(
+  pseudo_sample = colnames(pb_mat)
+) %>%
+  separate(pseudo_sample, into = c("patient", "genotype"), sep = "__", remove = FALSE) %>%
+  column_to_rownames("pseudo_sample")
+
+coldata$patient  <- factor(coldata$patient)
+coldata$genotype <- factor(coldata$genotype, levels = c("WT", "MUT"))  # WT = reference
+
+dds <- DESeqDataSetFromMatrix(
+  countData = pb_mat,
+  colData   = coldata,
+  design    = ~ patient + genotype   # patient as blocking factor -> paired comparison
+)
+
+# filter out genes with essentially no signal across pseudobulk samples
+dds <- dds[rowSums(counts(dds) >= 10) >= 2, ]
+
+dds <- DESeq(dds)
+pb_res <- results(dds, contrast = c("genotype", "MUT", "WT")) %>%
+  as.data.frame() %>%
+  rownames_to_column("gene") %>%
+  arrange(padj)
+
+head(pb_res, 20)
+pb_res %>% filter(gene == "GNAS")
+
+write.csv(pb_res, "Results/Osteoprogenitor_GNASmut_vs_WT_pseudobulk_DESeq2.csv", row.names = FALSE)
+```
+
+```{r pseudobulk_vs_percell}
+# Cross-check: how many of the per-cell test's significant genes hold up in pseudobulk?
+percell_sig  <- geno_results %>% filter(p_val_adj < 0.05) %>% pull(gene)
+pseudobulk_sig <- pb_res %>% filter(!is.na(padj), padj < 0.05) %>% pull(gene)
+
+length(percell_sig)
+length(pseudobulk_sig)
+length(intersect(percell_sig, pseudobulk_sig))
+
+# Genes significant per-cell but NOT in pseudobulk are the ones most likely to be
+# patient-confound artifacts rather than genuine genotype effects - treat with caution.
+setdiff(percell_sig, pseudobulk_sig) %>% head(20)
+```
